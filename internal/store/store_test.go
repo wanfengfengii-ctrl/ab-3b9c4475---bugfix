@@ -216,6 +216,190 @@ func TestTieBreakBySampleID(t *testing.T) {
 	}
 }
 
+// Instants written with different fractional-second precision must compare
+// by true time everywhere: plain walks, half-open ranges and keyset
+// continuation inside the same second.
+func TestMixedPrecisionInstantsOrderByTrueTime(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	base := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	snapSeq, err := st.InsertBatch(ctx, "mp", []Input{
+		{SampleID: "exact", TS: base, Value: 1},
+		{SampleID: "later", TS: base.Add(100 * time.Millisecond), Value: 2},
+		{SampleID: "mid", TS: base.Add(90 * time.Millisecond), Value: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := st.FetchPage(ctx, PageOptions{StreamID: "mp", SnapSeq: snapSeq, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, len(p.Items))
+	for i, it := range p.Items {
+		ids[i] = it.SampleID
+	}
+	if !eq(ids, []string{"exact", "mid", "later"}) {
+		t.Fatalf("walk order=%v", ids)
+	}
+	// Display form stays the canonical RFC3339Nano the API always returned.
+	if p.Items[0].TS != "2027-01-01T00:00:00Z" || p.Items[2].TS != "2027-01-01T00:00:00.1Z" {
+		t.Fatalf("display timestamps=%q,%q", p.Items[0].TS, p.Items[2].TS)
+	}
+
+	// A narrow half-open range covering all three instants keeps the
+	// whole-second sample too.
+	r, err := st.FetchPage(ctx, PageOptions{
+		StreamID: "mp", SnapSeq: snapSeq, Limit: 10,
+		From: "2027-01-01T00:00:00Z", To: "2027-01-01T00:00:00.5Z",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Items) != 3 {
+		t.Fatalf("range returned %d items, want 3", len(r.Items))
+	}
+	// 'to' is exclusive of the instant it names.
+	r, err = st.FetchPage(ctx, PageOptions{
+		StreamID: "mp", SnapSeq: snapSeq, Limit: 10,
+		From: "2027-01-01T00:00:00Z", To: "2027-01-01T00:00:00.1Z",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Items) != 2 || r.Items[0].SampleID != "exact" || r.Items[1].SampleID != "mid" {
+		t.Fatalf("exclusive-to range=%v", r.Items)
+	}
+	n, err := st.CountSnapshot(ctx, "mp", "2027-01-01T00:00:00Z", "2027-01-01T00:00:00.5Z", snapSeq)
+	if err != nil || n != 3 {
+		t.Fatalf("count=%d err=%v", n, err)
+	}
+
+	// Page size 1: the keyset boundary lands inside the same second and
+	// must still continue in true-time order without gaps or repeats.
+	var walked []string
+	afterTS, afterID := "", ""
+	for {
+		pg, err := st.FetchPage(ctx, PageOptions{
+			StreamID: "mp", SnapSeq: snapSeq, Limit: 1,
+			AfterTS: afterTS, AfterID: afterID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, it := range pg.Items {
+			walked = append(walked, it.SampleID)
+		}
+		if pg.NextAfterTS == "" {
+			break
+		}
+		afterTS, afterID = pg.NextAfterTS, pg.NextAfterID
+	}
+	if !eq(walked, []string{"exact", "mid", "later"}) {
+		t.Fatalf("paged walk=%v", walked)
+	}
+
+	// A keyset position in the pre-fix textual form (as carried by cursors
+	// issued before the canonical storage change) still resolves correctly.
+	legacy, err := st.FetchPage(ctx, PageOptions{
+		StreamID: "mp", SnapSeq: snapSeq, Limit: 10,
+		AfterTS: "2027-01-01T00:00:00Z", AfterID: "exact",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy.Items) != 2 || legacy.Items[0].SampleID != "mid" || legacy.Items[1].SampleID != "later" {
+		t.Fatalf("legacy cursor position=%v", legacy.Items)
+	}
+}
+
+// The same instant expressed with different precision (whole seconds vs
+// explicit zero fraction) must tie-break by sampleId.
+func TestSameInstantDifferentPrecisionTieBreak(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	instant := time.Date(2027, 6, 1, 0, 0, 0, 0, time.UTC)
+	snapSeq, err := st.InsertBatch(ctx, "tiep", []Input{
+		{SampleID: "b-id", TS: instant, Value: 1},
+		{SampleID: "a-id", TS: instant, Value: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := st.FetchPage(ctx, PageOptions{StreamID: "tiep", SnapSeq: snapSeq, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Items) != 2 || p.Items[0].SampleID != "a-id" || p.Items[1].SampleID != "b-id" {
+		t.Fatalf("tie order=%v", p.Items)
+	}
+}
+
+// Rows persisted by older versions (plain RFC3339Nano text) are rewritten
+// to the sortable canonical form when the store opens.
+func TestOpenMigratesLegacyTimestamps(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a pre-fix database: variable-precision RFC3339Nano text.
+	for _, row := range []struct{ id, ts string }{
+		{"exact", "2027-01-01T00:00:00Z"},
+		{"later", "2027-01-01T00:00:00.1Z"},
+		{"frac9", "2027-01-01T00:00:00.123456789Z"},
+	} {
+		if _, err := st.db.Exec(`INSERT INTO samples (stream_id, sample_id, ts, value, seq)
+			VALUES ('leg', ?, ?, 0, 1)`, row.id, row.ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.db.Exec(`INSERT INTO stream_meta (stream_id, next_seq) VALUES ('leg', 3)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st2, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st2.Close() }()
+
+	p, err := st2.FetchPage(ctx, PageOptions{StreamID: "leg", SnapSeq: 3, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, len(p.Items))
+	for i, it := range p.Items {
+		ids[i] = it.SampleID
+	}
+	if !eq(ids, []string{"exact", "later", "frac9"}) {
+		t.Fatalf("post-migration order=%v", ids)
+	}
+	// Migration is idempotent: a second open leaves the data canonical.
+	if err := st2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st3, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st3.Close() }()
+	p, err = st3.FetchPage(ctx, PageOptions{StreamID: "leg", SnapSeq: 3, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Items) != 3 || p.Items[0].SampleID != "exact" {
+		t.Fatalf("second open changed data: %v", p.Items)
+	}
+}
+
 func asConflict(err error, target **ConflictError) bool {
 	if err == nil {
 		return false

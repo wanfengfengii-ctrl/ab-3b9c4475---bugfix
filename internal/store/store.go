@@ -6,6 +6,13 @@
 // separate connection and see only rows with seq <= snapshotSeq, which makes
 // a paginated session a stable snapshot even when newer (including earlier
 // timestamped) samples arrive mid-walk.
+//
+// Timestamps are stored in a fixed-width canonical form (UTC, always nine
+// fractional digits) so that the text order of the ts column is exactly the
+// temporal order, no matter which fractional-second precision clients used.
+// Bounds and keyset positions arriving in any RFC3339 form — including ones
+// issued by older versions — are canonicalized at the query boundary, and
+// rows are converted back to canonical RFC3339Nano for display.
 package store
 
 import (
@@ -23,9 +30,45 @@ import (
 type Sample struct {
 	StreamID string
 	SampleID string
-	TS       string // canonical RFC3339Nano UTC
+	TS       string // canonical RFC3339Nano UTC (display form)
 	Value    int64
 	Seq      int64
+}
+
+// sortKeyLayout is the fixed-width timestamp form stored in the ts column.
+// Every legal RFC3339 instant maps to exactly one 30-character UTC string,
+// so lexicographic comparison of the column is temporal comparison. (With
+// plain RFC3339Nano text, "…00.1Z" would sort before "…00Z" because '.'
+// precedes 'Z', inverting the real order of mixed-precision instants.)
+const sortKeyLayout = "2006-01-02T15:04:05.000000000Z"
+
+// sortKey renders an instant in the stored canonical form.
+func sortKey(t time.Time) string {
+	return t.UTC().Format(sortKeyLayout)
+}
+
+// canonTS converts any RFC3339 timestamp text — a client-supplied bound, a
+// keyset position carried by an older cursor, or an already-canonical
+// stored key — into the stored sortable form. The conversion is idempotent.
+func canonTS(s string) (string, error) {
+	if s == "" {
+		return "", nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return "", fmt.Errorf("timestamp %q is not valid RFC3339: %w", s, err)
+	}
+	return sortKey(t), nil
+}
+
+// display renders a stored sortable key in the canonical RFC3339Nano UTC
+// form the API has always returned (trailing fractional zeros stripped).
+func display(key string) string {
+	t, err := time.Parse(time.RFC3339Nano, key)
+	if err != nil {
+		return key
+	}
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
 // ConflictError reports a rejected batch. Existing is true when a sampleId
@@ -79,6 +122,10 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := s.migrateSortKeys(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("timestamp migration: %w", err)
+	}
 	return s, nil
 }
 
@@ -109,6 +156,68 @@ func (s *Store) init(ctx context.Context) error {
 
 // Close releases the database handles.
 func (s *Store) Close() error { return s.db.Close() }
+
+// migrateSortKeys rewrites ts values stored by older versions — plain
+// RFC3339Nano text, whose lexicographic order is not temporal order once
+// fractional-second precision varies — to the canonical sortable form. It
+// is idempotent and a no-op on databases written by the current version.
+func (s *Store) migrateSortKeys(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT stream_id, sample_id, ts FROM samples`)
+	if err != nil {
+		return err
+	}
+	type fix struct {
+		streamID, sampleID, key string
+	}
+	var fixes []fix
+	for rows.Next() {
+		var f fix
+		var ts string
+		if err := rows.Scan(&f.streamID, &f.sampleID, &ts); err != nil {
+			rows.Close()
+			return err
+		}
+		t, err := time.Parse(time.RFC3339Nano, ts)
+		if err != nil {
+			continue // not a form this service ever wrote; leave untouched
+		}
+		if key := sortKey(t); key != ts {
+			f.key = key
+			fixes = append(fixes, f)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(fixes) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.PrepareContext(ctx,
+		`UPDATE samples SET ts = ? WHERE stream_id = ? AND sample_id = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for _, f := range fixes {
+		if _, err := stmt.ExecContext(ctx, f.key, f.streamID, f.sampleID); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
 
 // Ping verifies the database is reachable.
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
@@ -216,7 +325,7 @@ func (s *Store) InsertBatch(ctx context.Context, streamID string, in []Input) (n
 	for _, x := range in {
 		next++
 		if _, err = stmt.ExecContext(ctx, streamID, x.SampleID,
-			x.TS.UTC().Format(time.RFC3339Nano), x.Value, next); err != nil {
+			sortKey(x.TS), x.Value, next); err != nil {
 			return 0, err
 		}
 	}
@@ -236,7 +345,10 @@ func (s *Store) InsertBatch(ctx context.Context, streamID string, in []Input) (n
 
 // Page is one slice of a snapshot walk.
 type Page struct {
-	Items       []Sample
+	Items []Sample
+	// NextAfterTS/NextAfterID are the opaque keyset position to continue
+	// from; feed them back as PageOptions.AfterTS/AfterID. Empty means the
+	// walk is done.
 	NextAfterTS string
 	NextAfterID string
 }
@@ -244,34 +356,54 @@ type Page struct {
 // PageOptions narrows a snapshot walk.
 type PageOptions struct {
 	StreamID string
-	From, To string // canonical bounds; "" means unbounded
+	// From/To accept any RFC3339 form; "" means unbounded. To is exclusive.
+	From, To string
 	SnapSeq  int64
-	AfterTS  string // keyset position; "" = start
-	AfterID  string
-	Limit    int
+	// AfterTS/AfterID continue strictly after this keyset position;
+	// AfterTS "" = start. AfterTS may be any RFC3339 form, including
+	// positions issued by earlier versions of the service.
+	AfterTS string
+	AfterID string
+	Limit   int
 }
 
 // FetchPage returns the next limit samples of the immutable snapshot
 // (stream, range, seq <= snapSeq) strictly after the keyset position,
 // ordered by (timestamp, sampleId).
 func (s *Store) FetchPage(ctx context.Context, o PageOptions) (Page, error) {
+	// Bounds and the keyset position may arrive as any RFC3339 text (query
+	// bounds normalized by the API, positions carried by older cursors);
+	// canonicalize so the textual comparison in SQL is a temporal one.
+	from, err := canonTS(o.From)
+	if err != nil {
+		return Page{}, err
+	}
+	to, err := canonTS(o.To)
+	if err != nil {
+		return Page{}, err
+	}
+	after, err := canonTS(o.AfterTS)
+	if err != nil {
+		return Page{}, err
+	}
+
 	var (
 		where []string
 		args  []any
 	)
 	where = append(where, "stream_id = ?", "seq <= ?")
 	args = append(args, o.StreamID, o.SnapSeq)
-	if o.From != "" {
+	if from != "" {
 		where = append(where, "ts >= ?")
-		args = append(args, o.From)
+		args = append(args, from)
 	}
-	if o.To != "" {
+	if to != "" {
 		where = append(where, "ts < ?")
-		args = append(args, o.To)
+		args = append(args, to)
 	}
-	if o.AfterTS != "" {
+	if after != "" {
 		where = append(where, "(ts > ? OR (ts = ? AND sample_id > ?))")
-		args = append(args, o.AfterTS, o.AfterTS, o.AfterID)
+		args = append(args, after, after, o.AfterID)
 	}
 
 	q := `SELECT stream_id, sample_id, ts, value, seq FROM samples
@@ -304,6 +436,11 @@ func (s *Store) FetchPage(ctx context.Context, o PageOptions) (Page, error) {
 		page.NextAfterID = last.SampleID
 		page.Items = page.Items[:o.Limit]
 	}
+	// Rows carry the internal sortable key; callers get the canonical
+	// RFC3339Nano form the service has always returned.
+	for i := range page.Items {
+		page.Items[i].TS = display(page.Items[i].TS)
+	}
 	return page, nil
 }
 
@@ -311,20 +448,28 @@ func (s *Store) FetchPage(ctx context.Context, o PageOptions) (Page, error) {
 // by tests/verification to assert that a full walk returns every item of
 // the snapshot exactly once.
 func (s *Store) CountSnapshot(ctx context.Context, streamID, from, to string, snapSeq int64) (int, error) {
+	fromKey, err := canonTS(from)
+	if err != nil {
+		return 0, err
+	}
+	toKey, err := canonTS(to)
+	if err != nil {
+		return 0, err
+	}
 	var where []string
 	var args []any
 	where = append(where, "stream_id = ?", "seq <= ?")
 	args = append(args, streamID, snapSeq)
-	if from != "" {
+	if fromKey != "" {
 		where = append(where, "ts >= ?")
-		args = append(args, from)
+		args = append(args, fromKey)
 	}
-	if to != "" {
+	if toKey != "" {
 		where = append(where, "ts < ?")
-		args = append(args, to)
+		args = append(args, toKey)
 	}
 	var n int
-	err := s.db.QueryRowContext(ctx,
+	err = s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM samples WHERE `+strings.Join(where, " AND "),
 		args...).Scan(&n)
 	return n, err

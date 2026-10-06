@@ -143,6 +143,72 @@ func TestSnapshotPagination(t *testing.T) {
 	}
 }
 
+// Mixed fractional-second precision within one second: samples must be
+// ordered, range-filtered and continued by true time, not by text.
+func TestMixedPrecisionTimestamps(t *testing.T) {
+	srv, _ := newTestServer(t)
+	h := srv.Handler()
+
+	code, _ := do(t, h, "POST", "/api/streams/mp/samples", `{"samples":[
+		{"sampleId":"exact","timestamp":"2027-01-01T00:00:00Z","value":1},
+		{"sampleId":"later","timestamp":"2027-01-01T00:00:00.1Z","value":2}]}`)
+	if code != 201 {
+		t.Fatalf("seed: %d", code)
+	}
+
+	// Unbounded walk: real chronological order, canonical display kept.
+	code, body := do(t, h, "GET", "/api/streams/mp/samples?pageSize=10", "")
+	if code != 200 {
+		t.Fatalf("walk: %d", code)
+	}
+	items := mustItems(t, body)
+	if len(items) != 2 {
+		t.Fatalf("items=%v", items)
+	}
+	at := func(i int, key string) string { return items[i].(map[string]any)[key].(string) }
+	if at(0, "sampleId") != "exact" || at(1, "sampleId") != "later" {
+		t.Fatalf("order broken: %v", items)
+	}
+	if at(0, "timestamp") != "2027-01-01T00:00:00Z" || at(1, "timestamp") != "2027-01-01T00:00:00.1Z" {
+		t.Fatalf("display timestamps changed: %v", items)
+	}
+
+	// Narrow half-open range covering both instants returns both.
+	code, body = do(t, h, "GET",
+		"/api/streams/mp/samples?from=2027-01-01T00:00:00Z&to=2027-01-01T00:00:00.5Z", "")
+	if code != 200 {
+		t.Fatalf("range: %d", code)
+	}
+	if ids := idsOf(mustItems(t, body)); !eq(ids, []string{"exact", "later"}) {
+		t.Fatalf("range ids=%v", ids)
+	}
+
+	// A range that is empty in real time is still rejected, even when the
+	// textual order of the bounds disagrees with the temporal one.
+	code, _ = do(t, h, "GET",
+		"/api/streams/mp/samples?from=2027-01-01T00:00:00.5Z&to=2027-01-01T00:00:00Z", "")
+	if code != 400 {
+		t.Fatalf("inverted range should be 400, got %d", code)
+	}
+
+	// Page boundary inside the same second continues in true-time order.
+	code, body = do(t, h, "GET", "/api/streams/mp/samples?pageSize=1", "")
+	if code != 200 || body["done"].(bool) {
+		t.Fatalf("page1: code=%d body=%v", code, body)
+	}
+	if ids := idsOf(mustItems(t, body)); !eq(ids, []string{"exact"}) {
+		t.Fatalf("page1 ids=%v", ids)
+	}
+	cursor := body["nextCursor"].(string)
+	code, body = do(t, h, "GET", "/api/streams/mp/samples?pageSize=1&cursor="+cursor, "")
+	if code != 200 || !body["done"].(bool) {
+		t.Fatalf("page2: code=%d body=%v", code, body)
+	}
+	if ids := idsOf(mustItems(t, body)); !eq(ids, []string{"later"}) {
+		t.Fatalf("page2 ids=%v", ids)
+	}
+}
+
 func TestCursorErrors(t *testing.T) {
 	srv, _ := newTestServer(t)
 	h := srv.Handler()

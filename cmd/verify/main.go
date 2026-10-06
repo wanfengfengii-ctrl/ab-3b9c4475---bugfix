@@ -348,6 +348,58 @@ func runSmoke(r *runner, c *client) {
 	} else {
 		r.check("obtain range cursor", false, "no cursor raw=%s", rp.raw)
 	}
+
+	// 7. Mixed fractional-second precision: instants must order, filter and
+	// paginate by true time, never by their textual form.
+	st, _, _ = c.post("mixed", []sampleIn{
+		{SampleID: "exact", Timestamp: "2027-01-01T00:00:00Z", Value: 1},
+		{SampleID: "later", Timestamp: "2027-01-01T00:00:00.1Z", Value: 2},
+	})
+	r.check("mixed-precision seed accepted", st == 201, "status=%d", st)
+
+	mp := c.get("mixed", "pageSize=10")
+	r.check("mixed-precision page ok", mp.status == 200 && len(mp.Items) == 2,
+		"status=%d raw=%s", mp.status, mp.raw)
+	if len(mp.Items) == 2 {
+		r.check("whole-second sample sorts before later fractional one",
+			mp.Items[0].SampleID == "exact" && mp.Items[1].SampleID == "later",
+			"got=%s then %s", mp.Items[0].SampleID, mp.Items[1].SampleID)
+		r.check("display timestamps stay canonical",
+			mp.Items[0].Timestamp == "2027-01-01T00:00:00Z" &&
+				mp.Items[1].Timestamp == "2027-01-01T00:00:00.1Z",
+			"got=%q,%q", mp.Items[0].Timestamp, mp.Items[1].Timestamp)
+	}
+
+	// A narrow half-open range covering both instants returns both.
+	narrow, _, ok := walkAll(c, "mixed",
+		"pageSize=10&from=2027-01-01T00:00:00Z&to=2027-01-01T00:00:00.5Z")
+	r.check("narrow half-open range returns both instants",
+		ok && eqStrings(narrow, []string{"exact", "later"}),
+		"ids=%v ok=%v", narrow, ok)
+
+	// A page boundary inside the same second continues in true-time order.
+	m1 := c.get("mixed", "pageSize=1")
+	ok = m1.status == 200 && len(m1.Items) == 1 && m1.Items[0].SampleID == "exact" &&
+		m1.NextCursor != nil
+	r.check("first single-item page is the whole-second sample", ok, "raw=%s", m1.raw)
+	if ok {
+		m2 := c.get("mixed", "pageSize=1&cursor="+*m1.NextCursor)
+		r.check("second page continues in true-time order and finishes",
+			m2.status == 200 && len(m2.Items) == 1 && m2.Items[0].SampleID == "later" && m2.Done,
+			"raw=%s", m2.raw)
+	}
+
+	// The same instant expressed with different precision ties by sampleId.
+	st, _, _ = c.post("tiebreak", []sampleIn{
+		{SampleID: "b-id", Timestamp: "2027-06-01T00:00:00.000Z", Value: 1},
+		{SampleID: "a-id", Timestamp: "2027-06-01T00:00:00Z", Value: 2},
+	})
+	r.check("tie-break seed accepted", st == 201, "status=%d", st)
+	tb := c.get("tiebreak", "pageSize=10")
+	r.check("equal instants keep sampleId order",
+		tb.status == 200 && len(tb.Items) == 2 &&
+			tb.Items[0].SampleID == "a-id" && tb.Items[1].SampleID == "b-id",
+		"raw=%s", tb.raw)
 }
 
 // walkAll drains a session from its initial query string and returns ids.

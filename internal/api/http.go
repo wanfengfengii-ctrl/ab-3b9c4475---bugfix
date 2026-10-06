@@ -166,6 +166,7 @@ func (s *Server) getSamples(ctx context.Context, w http.ResponseWriter, r *http.
 	// Query-supplied bounds, canonicalized. They define the session on the
 	// first request and must not change on subsequent cursor requests.
 	var queryFrom, queryTo string
+	var fromT, toT time.Time
 	if raw := q.Get("from"); raw != "" {
 		t, err := time.Parse(time.RFC3339Nano, raw)
 		if err != nil {
@@ -173,6 +174,7 @@ func (s *Server) getSamples(ctx context.Context, w http.ResponseWriter, r *http.
 			return
 		}
 		queryFrom = cursor.Normalize(t)
+		fromT = t
 	}
 	if raw := q.Get("to"); raw != "" {
 		t, err := time.Parse(time.RFC3339Nano, raw)
@@ -181,8 +183,11 @@ func (s *Server) getSamples(ctx context.Context, w http.ResponseWriter, r *http.
 			return
 		}
 		queryTo = cursor.Normalize(t)
+		toT = t
 	}
-	if queryFrom != "" && queryTo != "" && queryFrom >= queryTo {
+	// Compare instants, not text: mixed fractional-second precisions do not
+	// order lexicographically ("…00Z" sorts after "…00.5Z" as text).
+	if queryFrom != "" && queryTo != "" && !fromT.Before(toT) {
 		writeError(w, http.StatusBadRequest, "bad_range", "from must be before to (to is exclusive)")
 		return
 	}
