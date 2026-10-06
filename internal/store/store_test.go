@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -213,6 +214,179 @@ func TestTieBreakBySampleID(t *testing.T) {
 	}
 	if got := []string{p.Items[0].SampleID, p.Items[1].SampleID, p.Items[2].SampleID}; !eq(got, []string{"a", "m", "z"}) {
 		t.Fatalf("tie order=%v", got)
+	}
+}
+
+// Mixed fractional-second precisions must order by true instant: the
+// variable-width RFC3339Nano text form sorts ".1Z" before "Z".
+func TestMixedPrecisionOrderingRangeAndKeyset(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	exact := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	later := exact.Add(100 * time.Millisecond)
+	snapSeq, err := st.InsertBatch(ctx, "mix", []Input{
+		{SampleID: "exact", TS: exact, Value: 1},
+		{SampleID: "later", TS: later, Value: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Unbounded walk: exact (whole second) before later (.1).
+	p, err := st.FetchPage(ctx, PageOptions{StreamID: "mix", SnapSeq: snapSeq, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{p.Items[0].SampleID, p.Items[1].SampleID}; !eq(got, []string{"exact", "later"}) {
+		t.Fatalf("unbounded order=%v", got)
+	}
+	if p.Items[0].TS != "2027-01-01T00:00:00Z" || p.Items[1].TS != "2027-01-01T00:00:00.1Z" {
+		t.Fatalf("display form changed: %q %q", p.Items[0].TS, p.Items[1].TS)
+	}
+
+	// Narrow half-open range covering both instants returns both.
+	from, to := "2027-01-01T00:00:00Z", "2027-01-01T00:00:00.2Z"
+	p, err = st.FetchPage(ctx, PageOptions{StreamID: "mix", SnapSeq: snapSeq, Limit: 10, From: from, To: to})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Items) != 2 {
+		t.Fatalf("range [%s,%s) returned %d items", from, to, len(p.Items))
+	}
+	if n, err := st.CountSnapshot(ctx, "mix", from, to, snapSeq); err != nil || n != 2 {
+		t.Fatalf("count=%d err=%v", n, err)
+	}
+
+	// A range ending between the two instants keeps only the whole-second one.
+	p, err = st.FetchPage(ctx, PageOptions{
+		StreamID: "mix", SnapSeq: snapSeq, Limit: 10,
+		From: "2026-12-31T23:59:59.5Z", To: "2027-01-01T00:00:00.05Z",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Items) != 1 || p.Items[0].SampleID != "exact" {
+		t.Fatalf("tight range items=%v", p.Items)
+	}
+
+	// Keyset walk with the page boundary inside the same second.
+	p1, err := st.FetchPage(ctx, PageOptions{StreamID: "mix", SnapSeq: snapSeq, Limit: 1})
+	if err != nil || len(p1.Items) != 1 || p1.Items[0].SampleID != "exact" {
+		t.Fatalf("page1=%v err=%v", p1.Items, err)
+	}
+	if p1.NextAfterTS != "2027-01-01T00:00:00Z" || p1.NextAfterID != "exact" {
+		t.Fatalf("page1 keyset=(%q,%q)", p1.NextAfterTS, p1.NextAfterID)
+	}
+	p2, err := st.FetchPage(ctx, PageOptions{
+		StreamID: "mix", SnapSeq: snapSeq, Limit: 1,
+		AfterTS: p1.NextAfterTS, AfterID: p1.NextAfterID,
+	})
+	if err != nil || len(p2.Items) != 1 || p2.Items[0].SampleID != "later" {
+		t.Fatalf("page2=%v err=%v", p2.Items, err)
+	}
+	if p2.NextAfterTS != "" {
+		t.Fatalf("page2 must end the walk, keyset=(%q,%q)", p2.NextAfterTS, p2.NextAfterID)
+	}
+}
+
+// Identical instants tie-break by sampleId; a single nanosecond of
+// difference still orders chronologically.
+func TestNanosecondOrderingAndTieBreak(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	base := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	snapSeq, err := st.InsertBatch(ctx, "tie2", []Input{
+		{SampleID: "b", TS: base, Value: 1},
+		{SampleID: "a", TS: base, Value: 2},
+		{SampleID: "c", TS: base.Add(time.Nanosecond), Value: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := st.FetchPage(ctx, PageOptions{StreamID: "tie2", SnapSeq: snapSeq, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := []string{p.Items[0].SampleID, p.Items[1].SampleID, p.Items[2].SampleID}
+	if !eq(got, []string{"a", "b", "c"}) {
+		t.Fatalf("tie order=%v", got)
+	}
+}
+
+// Databases written before the sort-key column existed must be migrated:
+// ts_key backfilled, old index replaced, ordering chronological.
+func TestMigrateLegacyRows(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy.db")
+
+	// Build a pre-fix database: no ts_key column, old text-ordered index.
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := []string{
+		`CREATE TABLE samples (
+			stream_id  TEXT NOT NULL,
+			sample_id  TEXT NOT NULL,
+			ts         TEXT NOT NULL,
+			value      INTEGER NOT NULL,
+			seq        INTEGER NOT NULL,
+			PRIMARY KEY (stream_id, sample_id)
+		) WITHOUT ROWID`,
+		`CREATE INDEX idx_samples_walk ON samples (stream_id, ts, sample_id, seq)`,
+		`CREATE TABLE stream_meta (
+			stream_id TEXT PRIMARY KEY,
+			next_seq  INTEGER NOT NULL
+		) WITHOUT ROWID`,
+		`INSERT INTO samples (stream_id, sample_id, ts, value, seq) VALUES
+			('s', 'exact', '2027-01-01T00:00:00Z', 1, 1),
+			('s', 'later', '2027-01-01T00:00:00.1Z', 2, 2)`,
+		`INSERT INTO stream_meta (stream_id, next_seq) VALUES ('s', 2)`,
+	}
+	for _, q := range legacy {
+		if _, err := raw.ExecContext(ctx, q); err != nil {
+			t.Fatalf("legacy setup: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	p, err := st.FetchPage(ctx, PageOptions{StreamID: "s", SnapSeq: 2, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{p.Items[0].SampleID, p.Items[1].SampleID}; !eq(got, []string{"exact", "later"}) {
+		t.Fatalf("migrated order=%v", got)
+	}
+	// Range and keyset comparisons work on backfilled rows too.
+	p, err = st.FetchPage(ctx, PageOptions{
+		StreamID: "s", SnapSeq: 2, Limit: 10,
+		From: "2027-01-01T00:00:00Z", To: "2027-01-01T00:00:00.2Z",
+	})
+	if err != nil || len(p.Items) != 2 {
+		t.Fatalf("migrated range items=%v err=%v", p.Items, err)
+	}
+	// New inserts after migration keep working.
+	if _, err := st.InsertBatch(ctx, "s", []Input{
+		{SampleID: "new", TS: time.Date(2027, 1, 1, 0, 0, 0, 500, time.UTC)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p, err = st.FetchPage(ctx, PageOptions{StreamID: "s", SnapSeq: 3, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := []string{p.Items[0].SampleID, p.Items[1].SampleID, p.Items[2].SampleID}
+	if !eq(got, []string{"exact", "new", "later"}) {
+		t.Fatalf("post-migration order=%v", got)
 	}
 }
 

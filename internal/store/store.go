@@ -28,6 +28,26 @@ type Sample struct {
 	Seq      int64
 }
 
+// keyLayout renders an instant with a fixed-width fraction so that
+// lexicographic order of the text equals chronological order. The canonical
+// RFC3339Nano display form cannot be ordered as text: its fraction is
+// variable-width, so "…:00.1Z" sorts before "…:00Z" ('.' < 'Z') even though
+// the instant is later.
+const keyLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+// tsKey converts an instant to its fixed-width sort key.
+func tsKey(t time.Time) string { return t.UTC().Format(keyLayout) }
+
+// displayToKey converts a canonical RFC3339Nano UTC timestamp (the form used
+// on the wire, in cursors and in the ts column) to its sort key.
+func displayToKey(s string) (string, error) {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return "", fmt.Errorf("canonical timestamp %q: %w", s, err)
+	}
+	return tsKey(t), nil
+}
+
 // ConflictError reports a rejected batch. Existing is true when a sampleId
 // was already present in the stream; otherwise the batch itself contained
 // duplicate ids.
@@ -88,12 +108,11 @@ func (s *Store) init(ctx context.Context) error {
 			stream_id  TEXT NOT NULL,
 			sample_id  TEXT NOT NULL,
 			ts         TEXT NOT NULL,
+			ts_key     TEXT,
 			value      INTEGER NOT NULL,
 			seq        INTEGER NOT NULL,
 			PRIMARY KEY (stream_id, sample_id)
 		) WITHOUT ROWID`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_walk
-			ON samples (stream_id, ts, sample_id, seq)`,
 		`CREATE TABLE IF NOT EXISTS stream_meta (
 			stream_id TEXT PRIMARY KEY,
 			next_seq  INTEGER NOT NULL
@@ -104,7 +123,116 @@ func (s *Store) init(ctx context.Context) error {
 			return fmt.Errorf("schema init: %w", err)
 		}
 	}
+	return s.migrate(ctx)
+}
+
+// migrate upgrades databases written by earlier versions: it adds the ts_key
+// sort-key column when missing, backfills it from the display timestamp and
+// replaces the old text-ordered walk index with a key-ordered one.
+func (s *Store) migrate(ctx context.Context) error {
+	hasKey, err := s.hasColumn(ctx, "samples", "ts_key")
+	if err != nil {
+		return err
+	}
+	if !hasKey {
+		if _, err := s.db.ExecContext(ctx,
+			`ALTER TABLE samples ADD COLUMN ts_key TEXT`); err != nil {
+			return fmt.Errorf("add ts_key column: %w", err)
+		}
+	}
+
+	// Backfill rows that predate the sort key, in one transaction.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx,
+		`SELECT stream_id, sample_id, ts FROM samples WHERE ts_key IS NULL`)
+	if err != nil {
+		return fmt.Errorf("scan legacy rows: %w", err)
+	}
+	type legacy struct{ stream, id, ts string }
+	var pending []legacy
+	for rows.Next() {
+		var l legacy
+		if err := rows.Scan(&l.stream, &l.id, &l.ts); err != nil {
+			rows.Close()
+			return err
+		}
+		pending = append(pending, l)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	if len(pending) > 0 {
+		upd, err := tx.PrepareContext(ctx,
+			`UPDATE samples SET ts_key = ? WHERE stream_id = ? AND sample_id = ?`)
+		if err != nil {
+			return err
+		}
+		for _, l := range pending {
+			key, err := displayToKey(l.ts)
+			if err != nil {
+				upd.Close()
+				return fmt.Errorf("backfill ts_key: %w", err)
+			}
+			if _, err := upd.ExecContext(ctx, key, l.stream, l.id); err != nil {
+				upd.Close()
+				return err
+			}
+		}
+		if err := upd.Close(); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	indexes := []string{
+		// The old index ordered by the variable-width display text, which
+		// misorders mixed-precision timestamps; replace it.
+		`DROP INDEX IF EXISTS idx_samples_walk`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_walk_key
+			ON samples (stream_id, ts_key, sample_id, seq)`,
+	}
+	for _, q := range indexes {
+		if _, err := s.db.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("index migration: %w", err)
+		}
+	}
 	return nil
+}
+
+// hasColumn reports whether the named table has the named column.
+func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			typ     string
+			notnull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // Close releases the database handles.
@@ -207,7 +335,8 @@ func (s *Store) InsertBatch(ctx context.Context, streamID string, in []Input) (n
 	}
 
 	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO samples (stream_id, sample_id, ts, value, seq) VALUES (?, ?, ?, ?, ?)`)
+		`INSERT INTO samples (stream_id, sample_id, ts, ts_key, value, seq)
+		 VALUES (?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return 0, err
 	}
@@ -216,7 +345,7 @@ func (s *Store) InsertBatch(ctx context.Context, streamID string, in []Input) (n
 	for _, x := range in {
 		next++
 		if _, err = stmt.ExecContext(ctx, streamID, x.SampleID,
-			x.TS.UTC().Format(time.RFC3339Nano), x.Value, next); err != nil {
+			x.TS.UTC().Format(time.RFC3339Nano), tsKey(x.TS), x.Value, next); err != nil {
 			return 0, err
 		}
 	}
@@ -244,9 +373,9 @@ type Page struct {
 // PageOptions narrows a snapshot walk.
 type PageOptions struct {
 	StreamID string
-	From, To string // canonical bounds; "" means unbounded
+	From, To string // canonical RFC3339Nano bounds; "" means unbounded
 	SnapSeq  int64
-	AfterTS  string // keyset position; "" = start
+	AfterTS  string // keyset position (canonical display form); "" = start
 	AfterID  string
 	Limit    int
 }
@@ -254,6 +383,10 @@ type PageOptions struct {
 // FetchPage returns the next limit samples of the immutable snapshot
 // (stream, range, seq <= snapSeq) strictly after the keyset position,
 // ordered by (timestamp, sampleId).
+//
+// Bounds and the keyset position arrive in the canonical RFC3339Nano display
+// form; they are converted to fixed-width sort keys before comparison so
+// that mixed fractional-second precisions order by true instant.
 func (s *Store) FetchPage(ctx context.Context, o PageOptions) (Page, error) {
 	var (
 		where []string
@@ -262,21 +395,33 @@ func (s *Store) FetchPage(ctx context.Context, o PageOptions) (Page, error) {
 	where = append(where, "stream_id = ?", "seq <= ?")
 	args = append(args, o.StreamID, o.SnapSeq)
 	if o.From != "" {
-		where = append(where, "ts >= ?")
-		args = append(args, o.From)
+		key, err := displayToKey(o.From)
+		if err != nil {
+			return Page{}, err
+		}
+		where = append(where, "ts_key >= ?")
+		args = append(args, key)
 	}
 	if o.To != "" {
-		where = append(where, "ts < ?")
-		args = append(args, o.To)
+		key, err := displayToKey(o.To)
+		if err != nil {
+			return Page{}, err
+		}
+		where = append(where, "ts_key < ?")
+		args = append(args, key)
 	}
 	if o.AfterTS != "" {
-		where = append(where, "(ts > ? OR (ts = ? AND sample_id > ?))")
-		args = append(args, o.AfterTS, o.AfterTS, o.AfterID)
+		key, err := displayToKey(o.AfterTS)
+		if err != nil {
+			return Page{}, err
+		}
+		where = append(where, "(ts_key > ? OR (ts_key = ? AND sample_id > ?))")
+		args = append(args, key, key, o.AfterID)
 	}
 
 	q := `SELECT stream_id, sample_id, ts, value, seq FROM samples
 	      WHERE ` + strings.Join(where, " AND ") + `
-	      ORDER BY ts ASC, sample_id ASC
+	      ORDER BY ts_key ASC, sample_id ASC
 	      LIMIT ?`
 	args = append(args, o.Limit+1)
 
@@ -316,12 +461,20 @@ func (s *Store) CountSnapshot(ctx context.Context, streamID, from, to string, sn
 	where = append(where, "stream_id = ?", "seq <= ?")
 	args = append(args, streamID, snapSeq)
 	if from != "" {
-		where = append(where, "ts >= ?")
-		args = append(args, from)
+		key, err := displayToKey(from)
+		if err != nil {
+			return 0, err
+		}
+		where = append(where, "ts_key >= ?")
+		args = append(args, key)
 	}
 	if to != "" {
-		where = append(where, "ts < ?")
-		args = append(args, to)
+		key, err := displayToKey(to)
+		if err != nil {
+			return 0, err
+		}
+		where = append(where, "ts_key < ?")
+		args = append(args, key)
 	}
 	var n int
 	err := s.db.QueryRowContext(ctx,

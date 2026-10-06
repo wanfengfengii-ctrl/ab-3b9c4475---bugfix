@@ -309,6 +309,38 @@ func runSmoke(r *runner, c *client) {
 	r.check("range session pins its own current snapshotSeq",
 		rangeSeq == 33 && rangeSeq > snapSeq, "got=%d", rangeSeq)
 
+	// 5b. Mixed fractional-second precisions are true instants: the
+	// whole-second sample must sort before the .1 sample everywhere.
+	st, pr, _ = c.post("mixed", []sampleIn{
+		{SampleID: "exact", Timestamp: "2027-01-01T00:00:00Z", Value: 1},
+		{SampleID: "later", Timestamp: "2027-01-01T00:00:00.1Z", Value: 2},
+	})
+	r.check("mixed-precision batch accepted", st == 201 && pr.Accepted == 2, "status=%d", st)
+
+	p10 := c.get("mixed", "pageSize=10")
+	mixedIDs := make([]string, 0, len(p10.Items))
+	for _, it := range p10.Items {
+		mixedIDs = append(mixedIDs, it.SampleID)
+	}
+	r.check("mixed-precision unbounded order is chronological",
+		p10.status == 200 && eqStrings(mixedIDs, []string{"exact", "later"}),
+		"status=%d ids=%v", p10.status, mixedIDs)
+
+	narrow, _, ok := walkAll(c, "mixed",
+		"pageSize=10&from=2027-01-01T00:00:00Z&to=2027-01-01T00:00:00.2Z")
+	r.check("narrow half-open range covering both instants returns both",
+		ok && eqStrings(narrow, []string{"exact", "later"}), "ids=%v ok=%v", narrow, ok)
+
+	walked, _, ok := walkAll(c, "mixed", "pageSize=1")
+	r.check("page boundary inside one second walks without skip/dup",
+		ok && eqStrings(walked, []string{"exact", "later"}), "ids=%v ok=%v", walked, ok)
+
+	bp := c.get("mixed", "from=2027-01-01T00:00:00.5Z&to=2027-01-01T00:00:00Z")
+	r.check("inverted mixed-precision range rejected",
+		bp.status == 400 && bp.Error == "bad_range", "status=%d err=%s", bp.status, bp.Error)
+	bp = c.get("mixed", "from=2027-01-01T00:00:00Z&to=2027-01-01T00:00:00.5Z")
+	r.check("same-second narrow range is legal", bp.status == 200, "status=%d raw=%s", bp.status, bp.raw)
+
 	// 6. Cursor error cases.
 	p := c.get("snap", "pageSize=7")
 	good := ""

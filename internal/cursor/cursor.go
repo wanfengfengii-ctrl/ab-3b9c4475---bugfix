@@ -41,8 +41,12 @@ type Token struct {
 	AfterID string `json:"aid,omitempty"`
 }
 
-// Normalize renders a time instant in the canonical form used both inside
-// cursors and in the database, so textual comparison equals temporal order.
+// Normalize renders a time instant in the canonical form used on the wire,
+// inside cursors and in the database's display column. Two instants are
+// equal iff their canonical forms are equal, which is what the cursor
+// range-pinning checks rely on. Note the form is NOT chronologically
+// sortable as text (the fraction is variable-width); the store keeps a
+// separate fixed-width sort key for ordering and range comparisons.
 func Normalize(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }

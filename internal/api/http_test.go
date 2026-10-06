@@ -197,6 +197,115 @@ func TestEmptyStreamSnapshot(t *testing.T) {
 	}
 }
 
+// Mixed fractional-second precisions must behave as true instants in
+// ordering, half-open ranges, cursor continuation and range validation.
+func TestMixedPrecisionTimestamps(t *testing.T) {
+	srv, _ := newTestServer(t)
+	h := srv.Handler()
+
+	code, _ := do(t, h, "POST", "/api/streams/mix/samples", `{"samples":[
+		{"sampleId":"exact","timestamp":"2027-01-01T00:00:00Z","value":1},
+		{"sampleId":"later","timestamp":"2027-01-01T00:00:00.1Z","value":2}]}`)
+	if code != 201 {
+		t.Fatalf("seed: %d", code)
+	}
+
+	// Unbounded query: real chronological order, exact before later.
+	code, body := do(t, h, "GET", "/api/streams/mix/samples?pageSize=10", "")
+	if code != 200 {
+		t.Fatalf("unbounded: %d", code)
+	}
+	if ids := idsOf(mustItems(t, body)); !eq(ids, []string{"exact", "later"}) {
+		t.Fatalf("unbounded ids=%v", ids)
+	}
+	if !body["done"].(bool) {
+		t.Fatalf("two items must fit one page: %v", body)
+	}
+
+	// Narrow half-open range covering both instants returns both.
+	code, body = do(t, h, "GET",
+		"/api/streams/mix/samples?from=2027-01-01T00:00:00Z&to=2027-01-01T00:00:00.2Z", "")
+	if code != 200 {
+		t.Fatalf("covering range: %d", code)
+	}
+	if ids := idsOf(mustItems(t, body)); !eq(ids, []string{"exact", "later"}) {
+		t.Fatalf("covering range ids=%v", ids)
+	}
+
+	// Half-open edge: 'to' between the instants keeps only the whole-second
+	// sample; 'from' past the whole second keeps only the fractional one.
+	code, body = do(t, h, "GET",
+		"/api/streams/mix/samples?from=2026-12-31T23:59:59.9Z&to=2027-01-01T00:00:00.05Z", "")
+	if ids := idsOf(mustItems(t, body)); code != 200 || !eq(ids, []string{"exact"}) {
+		t.Fatalf("upper edge: code=%d ids=%v", code, ids)
+	}
+	code, body = do(t, h, "GET",
+		"/api/streams/mix/samples?from=2027-01-01T00:00:00.000000001Z&to=2027-01-01T00:00:01Z", "")
+	if ids := idsOf(mustItems(t, body)); code != 200 || !eq(ids, []string{"later"}) {
+		t.Fatalf("lower edge: code=%d ids=%v", code, ids)
+	}
+
+	// Range validation compares instants: a whole-second 'from' before a
+	// fractional 'to' inside the same second is legal...
+	code, _ = do(t, h, "GET",
+		"/api/streams/mix/samples?from=2027-01-01T00:00:00Z&to=2027-01-01T00:00:00.5Z", "")
+	if code != 200 {
+		t.Fatalf("same-second narrow range must be legal: %d", code)
+	}
+	// ...and a fractional 'from' after a whole-second 'to' is rejected.
+	code, body = do(t, h, "GET",
+		"/api/streams/mix/samples?from=2027-01-01T00:00:00.5Z&to=2027-01-01T00:00:00Z", "")
+	if code != 400 || body["error"] != "bad_range" {
+		t.Fatalf("inverted mixed-precision range: code=%d body=%v", code, body)
+	}
+
+	// Paginating with the page boundary inside the same second: no skips,
+	// duplicates or reordering, and the snapshot seq stays pinned.
+	var ids []string
+	var seq float64 = -1
+	cursor := ""
+	for pages := 0; ; pages++ {
+		q := "/api/streams/mix/samples?pageSize=1"
+		if cursor != "" {
+			q += "&cursor=" + cursor
+		}
+		code, body = do(t, h, "GET", q, "")
+		if code != 200 {
+			t.Fatalf("walk page %d: %d", pages, code)
+		}
+		if seq == -1 {
+			seq = body["snapshotSeq"].(float64)
+		} else if body["snapshotSeq"].(float64) != seq {
+			t.Fatalf("snapshotSeq drifted: %v", body)
+		}
+		for _, it := range mustItems(t, body) {
+			ids = append(ids, itemID(it.(map[string]any)))
+		}
+		if body["done"].(bool) {
+			break
+		}
+		cursor = body["nextCursor"].(string)
+		if pages > 5 {
+			t.Fatal("walk did not terminate")
+		}
+	}
+	if !eq(ids, []string{"exact", "later"}) {
+		t.Fatalf("walk ids=%v", ids)
+	}
+
+	// The same instant posted with different precisions ties on sampleId.
+	code, _ = do(t, h, "POST", "/api/streams/mixtie/samples", `{"samples":[
+		{"sampleId":"b","timestamp":"2027-01-01T00:00:00Z","value":1},
+		{"sampleId":"a","timestamp":"2027-01-01T00:00:00.0Z","value":2}]}`)
+	if code != 201 {
+		t.Fatalf("tie seed: %d", code)
+	}
+	code, body = do(t, h, "GET", "/api/streams/mixtie/samples", "")
+	if ids := idsOf(mustItems(t, body)); code != 200 || !eq(ids, []string{"a", "b"}) {
+		t.Fatalf("same-instant tie: code=%d ids=%v", code, ids)
+	}
+}
+
 func idsOf(items []any) []string {
 	out := make([]string, len(items))
 	for i, it := range items {
