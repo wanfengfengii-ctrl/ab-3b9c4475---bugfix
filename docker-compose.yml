@@ -1,0 +1,71 @@
+# Docker Compose for the ocean observation snapshot service.
+#
+# Quick start (runs app + the one-shot verify suite against a clean stack,
+# verify's exit code becomes the command's exit code):
+#
+#   HOST_PORT=18080 docker compose up --build --abort-on-container-exit \
+#       --exit-code-from verify
+#
+# Full end-to-end (clean start, smoke verify, app restart, cursor resume):
+#   ./scripts/e2e.sh
+services:
+  app:
+    build:
+      context: .
+    image: oceanwatch:latest
+    environment:
+      # Container-internal listen port.
+      PORT: "8080"
+      DB_PATH: /data/oceanwatch.db
+      DEFAULT_PAGE_SIZE: "50"
+      MAX_PAGE_SIZE: "200"
+      # Pin a cursor secret in real deployments. When unset, the server
+      # persists a random secret at ${DB_PATH}.secret, which also keeps
+      # cursors valid across restarts.
+      # CURSOR_SECRET: "change-me"
+    ports:
+      # Host-side port is configurable via the HOST_PORT environment variable.
+      - "${HOST_PORT:-8080}:8080"
+    volumes:
+      - app-data:/data
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/server", "-healthcheck"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One-shot service: waits for a healthy, clean app, seeds data, walks
+  # pages while inserting earlier-timestamp samples, and reports the result
+  # through its exit code (0 = pass, non-zero = failure).
+  verify:
+    image: oceanwatch:latest
+    build:
+      context: .
+    command: ["/usr/local/bin/verify", "-mode=smoke"]
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://app:8080
+      RESTART_STATE_PATH: /shared/restart.json
+    volumes:
+      - verify-shared:/shared
+
+  # Second one-shot phase used by scripts/e2e.sh: resumes a cursor that was
+  # parked before an app restart. Not started by a plain `compose up`.
+  verify-resume:
+    image: oceanwatch:latest
+    profiles: ["resume"]
+    command: ["/usr/local/bin/verify", "-mode=resume"]
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://app:8080
+      RESTART_STATE_PATH: /shared/restart.json
+    volumes:
+      - verify-shared:/shared
+
+volumes:
+  app-data:
+  verify-shared:

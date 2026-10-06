@@ -1,0 +1,9 @@
+.git
+.gitignore
+*.db
+*.db-wal
+*.db-shm
+*.secret
+data/
+/shared/
+*.md
